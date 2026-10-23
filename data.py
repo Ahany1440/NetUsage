@@ -34,6 +34,8 @@ DB_PATH = os.path.join(DATA_DIR, "usage.db")
 SRUM_SRC = r"C:\Windows\System32\sru\SRUDB.dat"
 SRUM_TOTAL = "windows (no app name)"  # SRUM's empty-id row: all traffic on the adapter that hour
 OTHER = "Unattributed"  # traffic nobody could tie to an app (SRUM gaps, UDP, headers)
+# what older versions called that leftover in saved live rows, after display_name()
+LEFTOVER_NAMES = {OTHER, "Other (udp, system)"}
 
 
 def _db():
@@ -63,7 +65,7 @@ def app_name(raw):
 NAMES = {
     "steam.exe": "Steam", "steamwebhelper.exe": "Steam", "steamservice.exe": "Steam",
     "epiconlineservicesinstallhelper.exe": "Epic Games", "epicgameslauncher.exe": "Epic Games",
-    "epiconlineserviceshost.exe": "Epic Games", "eabackgroundservice": "EA app", "upc.exe": "Ubisoft Connect",
+    "epiconlineserviceshost.exe": "Epic Games", "eabackgroundservice": "EA app", "eadesktop.exe": "EA app", "eaanticheat.installer.exe": "EA app", "upc.exe": "Ubisoft Connect",
     "dosvc": "Windows Update", "wuauserv": "Windows Update", "svchost.exe": "Windows services",
     "brave.exe": "Brave", "chrome.exe": "Chrome", "firefox.exe": "Firefox", "msedge.exe": "Microsoft Edge",
     "msedgewebview2.exe": "Edge WebView", "discord.exe": "Discord", "spotify.exe": "Spotify",
@@ -78,8 +80,9 @@ STORE_APP = re.compile(r"^(?:[\w-]+\.)*([\w-]+?)_[\d.]+_(?:x64|x86|arm64|neutral
 
 def display_name(app):
     """'steam.exe' -> 'Steam', 'claude_3.6556.1.0_x64__pzs8sxrjxfjjc' -> 'Claude'."""
-    if app in NAMES:
-        return NAMES[app]
+    for key in (app.lower(), app.lower() + ".exe"):  # saved live rows may already be display names
+        if key in NAMES:
+            return NAMES[key]
     m = STORE_APP.match(app)
     if m:
         app = NAMES.get(m[1].lower() + ".exe", m[1])
@@ -160,34 +163,50 @@ def import_steam_log():
 
 
 EPIC_STAT = re.compile(r"^\[(\d{4}\.\d\d\.\d\d-\d\d\.\d\d\.\d\d):(\d+)\]\[\s*\d+\]LogBuildPatchServices: "
-                       r"Build Stat: (TotalDownloadedData|ProcessActiveTime): ([\d.,]+) ?(\w*)")
+                       r"Build Stat: (TotalDownloadedData|ProcessActiveTime): ([\d.,:]+) ?(\w*)")
 EPIC_UNITS = {"us": 1e-6, "ms": 1e-3, "sec": 1, "min": 60, "hr": 3600, "hrs": 3600}
 
 
+def _epic_seconds(value, unit):
+    """'398.725 ms' -> 0.4, '9.83 sec' -> 9.83, '1:27 min' -> 87 (longer times are written m:ss or h:mm:ss)."""
+    if ":" in value:
+        secs = 0
+        for part in value.split(":"):
+            secs = secs * 60 + float(part)
+        return secs
+    return float(value.replace(",", "")) * EPIC_UNITS.get(unit, 0)
+
+
 def import_epic_log():
-    """Epic logs one summary per finished install: total bytes and how long it ran.
-    The bytes are spread back over that time in 10-minute pieces. Returns rows added."""
-    logs = os.path.join(os.environ.get("LOCALAPPDATA", ""), "EpicGamesLauncher", "Saved", "Logs")
-    rows, size = [], 0
-    for path in glob.glob(os.path.join(logs, "EpicGamesLauncher*.log")):
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                m = EPIC_STAT.match(line)
-                if not m:
-                    continue
-                value = float(m[4].replace(",", ""))
-                if m[3] == "TotalDownloadedData":
-                    size = int(value)
-                elif size:  # ProcessActiveTime closes the summary that TotalDownloadedData opened
-                    # Epic's log times are UTC.
-                    end = int(datetime.strptime(m[1], "%Y.%m.%d-%H.%M.%S").replace(tzinfo=timezone.utc).timestamp())
-                    # shortcut: assumes no pause right before the summary; pauses shift bytes a little earlier
-                    secs = max(int(value * EPIC_UNITS.get(m[5], 0)), 1)
-                    pieces = -(-secs // 600)  # ceil: one piece per started 10 minutes
-                    for i in range(pieces):
-                        rows.append((end - secs + int((i + 0.5) * secs / pieces), "epicgameslauncher.exe", 0,
-                                     size // pieces, "applog", f"epic|{m[1]}:{m[2]}|{i}"))
-                    size = 0
+    """Epic's launcher and Fortnite each log one summary per finished download: total bytes and how long it
+    ran. The bytes are spread back over that time in 10-minute pieces. Returns rows added."""
+    local = os.environ.get("LOCALAPPDATA", "")
+    sources = [(os.path.join(local, "EpicGamesLauncher", "Saved", "Logs", "EpicGamesLauncher*.log"),
+                "epicgameslauncher.exe", "epic"),
+               # Fortnite downloads extra game content itself, outside Epic's installer
+               (os.path.join(local, "FortniteGame", "Saved", "Logs", "FortniteGame*.log"),
+                "fortniteclient-win64-shipping.exe", "fortnite")]
+    rows = []
+    for pattern, app, tag in sources:
+        for path in glob.glob(pattern):
+            size = 0
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    m = EPIC_STAT.match(line)
+                    if not m:
+                        continue
+                    if m[3] == "TotalDownloadedData":
+                        size = int(m[4].replace(",", ""))
+                    elif size:  # ProcessActiveTime closes the summary that TotalDownloadedData opened
+                        # Epic's log times are UTC.
+                        end = int(datetime.strptime(m[1], "%Y.%m.%d-%H.%M.%S").replace(tzinfo=timezone.utc).timestamp())
+                        # shortcut: assumes no pause right before the summary; pauses shift bytes a little earlier
+                        secs = max(int(_epic_seconds(m[4], m[5])), 1)
+                        pieces = -(-secs // 600)  # ceil: one piece per started 10 minutes
+                        for i in range(pieces):
+                            rows.append((end - secs + int((i + 0.5) * secs / pieces), app, 0,
+                                         size // pieces, "applog", f"{tag}|{m[1]}:{m[2]}|{i}"))
+                        size = 0
     return _insert(rows) + _import_epic_installer_logs()
 
 
@@ -226,21 +245,25 @@ def _hourly_rows(con, since):
     for ts, app, s, r in con.execute("SELECT ts, app, sent, recv FROM usage WHERE src = 'srum' AND ts >= ?",
                                      (since - 3600,)):
         total, apps = hours[ts]
-        target = total if app == SRUM_TOTAL else apps[app]
+        target = total if app == SRUM_TOTAL else apps[display_name(app)]  # e.g. steam + steamwebhelper -> Steam
         target[0] += r
         target[1] += s
 
-    # SRUM only credits apps with part of their traffic; an app's own log is exact, so it wins.
+    # SRUM only credits apps with part of their traffic. An app's own log and NetUsage's live recording
+    # measure it directly, so per app and hour the biggest of the three wins (they overlap, never add).
     starts = sorted(hours)
-    logged = defaultdict(int)
-    for ts, app, r in con.execute("SELECT ts, app, recv FROM usage WHERE src = 'applog' AND ts >= ?",
-                                  (since - 3600,)):
+    better = {src: defaultdict(lambda: [0, 0]) for src in ("applog", "live")}
+    for src, ts, app, r, s in con.execute("SELECT src, ts, app, recv, sent FROM usage WHERE src IN ('applog', 'live') "
+                                          "AND ts >= ?", (since - 3600,)):
         i = bisect_right(starts, ts) - 1
-        if i >= 0 and ts < starts[i] + 3600:
-            logged[starts[i], app] += r
-    for (ts, app), r in logged.items():
-        rec = hours[ts][1][app]
-        rec[0] = max(rec[0], r)
+        name = display_name(app)
+        if i >= 0 and ts < starts[i] + 3600 and name not in LEFTOVER_NAMES:
+            better[src][starts[i], name][0] += r
+            better[src][starts[i], name][1] += s
+    for found in better.values():
+        for (ts, app), (r, s) in found.items():
+            rec = hours[ts][1][app]
+            rec[0], rec[1] = max(rec[0], r), max(rec[1], s)
 
     rows = []
     for ts, (total, apps) in hours.items():
@@ -416,8 +439,9 @@ class UdpCounter:
         subprocess.run(["logman", "stop", UDP_SESSION, "-ets"], capture_output=True,
                        creationflags=subprocess.CREATE_NO_WINDOW)
         # raw records: the library's own field decoding cost half a CPU core during a call
+        # ignore_exists_error=False: never attach to a session another NetUsage owns (e.g. the tray copy)
         self._etw = etw.ETW(session_name=UDP_SESSION, providers=[provider], event_callback=self._on_record,
-                            callback_data_flag=RETURN_RAW_UNFORMATTED_DATA)
+                            callback_data_flag=RETURN_RAW_UNFORMATTED_DATA, ignore_exists_error=False)
         self._etw.start()
 
     def _on_record(self, event):
@@ -451,9 +475,16 @@ VIRTUAL_NICS = ("loopback", "vethernet", "virtual", "hyper-v", "vpn", "tap", "tu
 def _nic_totals():
     # shortcut: name-based filter for virtual adapters (their traffic also crosses the real NIC);
     # switch to GetIfTable2's HardwareInterface flag if an odd adapter name gets through.
-    nics = [c for name, c in psutil.net_io_counters(pernic=True).items()
-            if not any(v in name.lower() for v in VIRTUAL_NICS)]
-    return sum(c.bytes_sent for c in nics), sum(c.bytes_recv for c in nics)
+    return {name: (c.bytes_sent, c.bytes_recv) for name, c in psutil.net_io_counters(pernic=True).items()
+            if not any(v in name.lower() for v in VIRTUAL_NICS)}
+
+
+def _nic_delta(old, new):
+    """(sent, recv) between two _nic_totals() readings. Each adapter is compared only with itself, and only
+    if it was there both times: after sleep Wi-Fi drops out and comes back carrying its whole running count."""
+    common = old.keys() & new.keys()
+    return (sum(max(new[n][0] - old[n][0], 0) for n in common),
+            sum(max(new[n][1] - old[n][1], 0) for n in common))
 
 
 class LiveSampler(threading.Thread):
@@ -507,7 +538,7 @@ class LiveSampler(threading.Thread):
     def _sample(self):
         now, nic = time.time(), _nic_totals()
         dt = max(now - self._last_t, 0.001)
-        sent, recv = max(nic[0] - self._last_nic[0], 0), max(nic[1] - self._last_nic[1], 0)
+        sent, recv = _nic_delta(self._last_nic, nic)
         self._last_nic, self._last_t = nic, now
 
         cur = tcp_counters(self._enabled)

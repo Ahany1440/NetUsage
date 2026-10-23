@@ -60,6 +60,22 @@ apps = {a: r for a, r, _ in h["apps"]}
 assert apps["Steam"] == 7000 and data.OTHER not in apps or apps[data.OTHER] == 0, apps
 assert sum(h["recv"]) == 7000 + 1000 + 700, h
 
+# NetUsage's own live recording inside a Windows hour names apps Windows missed;
+# its leftover rows (old names too, like a bogus wake-from-sleep spike) are ignored there.
+con = data._db()
+with con:
+    con.executemany("INSERT INTO usage VALUES (?,?,?,?,?,?)", [
+        (hour + 1500, "Discord", 40, 600, "live", None),
+        (hour + 1560, "discord.exe", 10, 200, "live", None),           # older build's raw name: same app
+        (hour + 1600, "unattributed", 0, 9 * 10**9, "live", None),
+        (hour + 1600, "other (udp, system)", 0, 9 * 10**9, "live", None),
+    ])
+con.close()
+h = data.history(24, "hour")
+apps = {a: (r, s) for a, r, s in h["apps"]}
+assert apps["Discord"] == (800 + 700, 50 + 10), apps                # 800 in the Windows hour + the later live 700
+assert sum(h["recv"]) == 7000 + 1000 + 800 + 700, h                 # Discord raised the hour; no 9 GB leftovers
+
 # Epic: one summary per install, bytes spread over the time it ran (30 min -> 3 pieces).
 logs = os.path.join(data.DATA_DIR, "EpicGamesLauncher", "Saved", "Logs")
 os.makedirs(logs)
@@ -88,6 +104,24 @@ con.close()
 minute = 1792696080  # 2026-10-22 19:08:00 UTC
 assert got == [(minute + 30, 400), (minute + 90, 650)], got  # 600 more, then 50 from the new task
 
+# Epic durations: long ones are written m:ss / h:mm:ss.
+assert abs(data._epic_seconds("398.725", "ms") - 0.398725) < 1e-9
+assert data._epic_seconds("9.83", "sec") == 9.83
+assert data._epic_seconds("1:27", "min") == 87
+assert data._epic_seconds("1:02:03", "hrs") == 3723
+# Fortnite's own log, same summary format: 2:36 min -> 1 piece, credited to Fortnite.
+fn = os.path.join(data.DATA_DIR, "FortniteGame", "Saved", "Logs")
+os.makedirs(fn)
+with open(os.path.join(fn, "FortniteGame.log"), "w") as fh:
+    fh.write("[2026.10.23-14.48.58:659][440]LogBuildPatchServices: Build Stat: TotalDownloadedData: 376004543\n"
+             "[2026.10.23-14.48.58:660][440]LogBuildPatchServices: Build Stat: ProcessActiveTime: 2:36 min\n")
+assert data.import_epic_log() == 1
+con = data._db()
+got = con.execute("SELECT app, recv, ts FROM usage WHERE key LIKE 'fortnite|%'").fetchall()
+con.close()
+assert got == [("fortniteclient-win64-shipping.exe", 376004543, 1792766938 - 156 + 78)], got
+assert data.display_name(got[0][0]) == "Fortnite"
+
 # Live sampler: per-app deltas from fake TCP counters must reach the top list.
 ticks = [0]
 data.tcp_counters = lambda enabled: {("k",): (os.getpid(), ticks[0] * 1000, ticks[0] * 50000)}
@@ -109,6 +143,13 @@ open(os.path.join(usb, "portable.txt"), "w").close()
 assert data._data_dir() == os.path.join(usb, "NetUsage data", "TESTPC")
 del sys.frozen
 sys.executable = real_exe
+
+# Adapters: one that drops out and comes back (wake from sleep) must not count its whole history.
+before = {"Wi-Fi": (100, 1000)}
+assert data._nic_delta(before, {}) == (0, 0)                                    # asleep: Wi-Fi gone
+assert data._nic_delta({}, {"Wi-Fi": (5 * 10**9, 8 * 10**9)}) == (0, 0)         # back with its running count
+assert data._nic_delta(before, {"Wi-Fi": (150, 1600)}) == (50, 600)             # normal second
+assert data._nic_delta(before, {"Wi-Fi": (10, 20)}) == (0, 0)                   # counter reset
 
 # UDP: events add up per process; traffic between programs on this PC is ignored.
 from collections import defaultdict
