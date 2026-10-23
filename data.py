@@ -4,6 +4,7 @@ import glob
 import os
 import re
 import sqlite3
+import struct
 import subprocess
 import sys
 import threading
@@ -377,6 +378,73 @@ def tcp_counters(enabled):
     return out
 
 
+# ---------- Live per-app UDP bytes (Windows Kernel-Network events, needs admin) ----------
+
+UDP_EVENTS = {42: 0, 43: 1, 58: 0, 59: 1}  # event id -> index: 0 sent, 1 received (IPv4, IPv4, IPv6, IPv6)
+UDP_SESSION = "NetUsage-UDP"
+
+
+class _EventIds(ctypes.Structure):  # EVENT_FILTER_EVENT_ID, sized for our 4 ids
+    _fields_ = [("filter_in", ctypes.c_ubyte), ("reserved", ctypes.c_ubyte),
+                ("count", ctypes.c_ushort), ("ids", ctypes.c_ushort * 4)]
+
+
+def _is_loopback(addr):
+    return addr[0] == 127 if len(addr) == 4 else (addr == bytes(15) + bytes([1])  # ::1
+        or (addr[:12] == bytes(10) + bytes([255, 255]) and addr[12] == 127))  # ::ffff:127.x
+
+
+class UdpCounter:
+    """Per-process UDP bytes (calls, streams, games, QUIC) from Windows' network event feed.
+    Windows only sends the 4 UDP event ids, so TCP downloads don't wake Python."""
+
+    def __init__(self):
+        import etw
+        import etw.etw
+        from etw import evntprov
+        from etw.common import RETURN_RAW_UNFORMATTED_DATA
+        self.lock = threading.Lock()
+        self.bytes = defaultdict(lambda: [0, 0])  # pid -> [sent, recv]
+        self._ids = _EventIds(1, 0, len(UDP_EVENTS), (ctypes.c_ushort * 4)(*UDP_EVENTS))
+        flt = evntprov.EVENT_FILTER_DESCRIPTOR(ctypes.addressof(self._ids), ctypes.sizeof(self._ids),
+                                               evntprov.EVENT_FILTER_TYPE_EVENT_ID)
+        self._params = etw.etw.ProviderParameters(0, [flt])  # kept on self: Windows reads it at start()
+        provider = etw.ProviderInfo("Microsoft-Windows-Kernel-Network",
+                                    etw.GUID("{7DD42A49-5329-4832-8DFD-43D979153A88}"),
+                                    any_keywords=0x30, params=self._params.get())  # 0x30: IPv4 + IPv6
+        # a session left behind by a crash would block ours; stopping a missing one is harmless
+        subprocess.run(["logman", "stop", UDP_SESSION, "-ets"], capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+        # raw records: the library's own field decoding cost half a CPU core during a call
+        self._etw = etw.ETW(session_name=UDP_SESSION, providers=[provider], event_callback=self._on_record,
+                            callback_data_flag=RETURN_RAW_UNFORMATTED_DATA)
+        self._etw.start()
+
+    def _on_record(self, event):
+        rec = event[1].contents
+        self.add(rec.EventHeader.EventDescriptor.Id, ctypes.string_at(rec.UserData, rec.UserDataLength))
+
+    def add(self, event_id, payload):
+        """payload starts PID, size (uint32 each), then destination and source address (4 or 16 bytes)."""
+        if event_id not in UDP_EVENTS or len(payload) < 16:
+            return
+        pid, size = struct.unpack_from("<II", payload)
+        n = 4 if event_id in (42, 43) else 16
+        if any(_is_loopback(payload[8 + i * n:8 + (i + 1) * n]) for i in (0, 1)):
+            return  # traffic between programs on this PC never touches the network
+        with self.lock:
+            self.bytes[pid][UDP_EVENTS[event_id]] += size
+
+    def take(self):
+        """{pid: [sent, recv]} since the last call."""
+        with self.lock:
+            out, self.bytes = self.bytes, defaultdict(lambda: [0, 0])
+        return out
+
+    def stop(self):
+        self._etw.stop()
+
+
 VIRTUAL_NICS = ("loopback", "vethernet", "virtual", "hyper-v", "vpn", "tap", "tunnel", "wsl")
 
 
@@ -401,6 +469,14 @@ class LiveSampler(threading.Thread):
         self._enabled = set()
         self._prev = {}
         self._minute = defaultdict(lambda: [0, 0])  # app -> [sent, recv]
+        try:
+            self._udp = UdpCounter()
+        except Exception:
+            self._udp = None  # not admin: UDP stays in Unattributed
+
+    def stop(self):
+        if self._udp:
+            self._udp.stop()
 
     def _app(self, pid):  # not _name: Thread uses that attribute
         if pid not in self._apps:
@@ -443,6 +519,9 @@ class LiveSampler(threading.Thread):
                 per_app[self._app(pid)][0] += max(b_out - p_out, 0)
                 per_app[self._app(pid)][1] += max(b_in - p_in, 0)
         self._prev = {k: (v[1], v[2]) for k, v in cur.items()}
+        for pid, (s, r) in (self._udp.take() if self._udp else {}).items():
+            per_app[self._app(pid)][0] += s
+            per_app[self._app(pid)][1] += r
         # NIC counters include headers, UDP and QUIC; whatever TCP stats can't place goes here.
         per_app[OTHER][0] += max(sent - sum(v[0] for v in per_app.values()), 0)
         per_app[OTHER][1] += max(recv - sum(v[1] for v in per_app.values()), 0)

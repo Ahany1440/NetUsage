@@ -3,3 +3,4 @@ matplotlib
 psutil
 dissect.esedb
 pystray
+pywintrace

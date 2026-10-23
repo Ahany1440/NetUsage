@@ -110,6 +110,24 @@ assert data._data_dir() == os.path.join(usb, "NetUsage data", "TESTPC")
 del sys.frozen
 sys.executable = real_exe
 
+# UDP: events add up per process; traffic between programs on this PC is ignored.
+from collections import defaultdict
+import threading
+u = data.UdpCounter.__new__(data.UdpCounter)  # skip starting the real Windows feed (needs admin)
+u.lock, u.bytes = threading.Lock(), defaultdict(lambda: [0, 0])
+import socket, struct
+v4 = lambda pid, size, dst, src: struct.pack("<II", pid, size) + socket.inet_aton(dst) + socket.inet_aton(src) + bytes(8)
+v6 = lambda pid, size, dst, src: (struct.pack("<II", pid, size) + socket.inet_pton(socket.AF_INET6, dst)
+                                  + socket.inet_pton(socket.AF_INET6, src) + bytes(8))
+u.add(42, v4(32032, 1200, "162.159.130.234", "192.168.1.5"))
+u.add(43, v4(32032, 900, "192.168.1.5", "162.159.130.234"))
+u.add(59, v6(32032, 100, "fe80::1", "2606:4700::1"))
+u.add(43, v4(500, 50, "127.0.0.1", "127.0.0.1"))       # between programs on this PC: ignored
+u.add(59, v6(500, 50, "::1", "::1"))                   # same, IPv6
+u.add(11, v4(500, 999, "8.8.8.8", "192.168.1.5"))      # a TCP event slipping through: ignored
+assert dict(u.take()) == {32032: [1200, 1000]}, u.bytes
+assert dict(u.take()) == {}  # take() empties it
+
 # 5-minute view: samples land in 10-second bars; anything older than 5 minutes drops out.
 s = data.LiveSampler()
 now = time.time()

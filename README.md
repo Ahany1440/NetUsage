@@ -49,8 +49,8 @@ Windows' usage history shows what every user on that PC did online, so only use 
 - Windows keeps a hidden row with **no app name** that holds the **total** traffic on your adapter for each hour. NetUsage uses it as the real total, so nothing is counted twice.
 - Windows only credits apps with part of their traffic (for example about a third of a Steam download). **Steam's download log** records exact bytes, so NetUsage uses that for Steam.
 - **Epic Games**: game installs and updates are logged second by second by Epic's install helper, so they count exactly. Launcher self-updates are logged as one summary when they finish, and NetUsage spreads those bytes over the time they took.
-- Whatever is left after the named apps shows as **Unattributed**: traffic nobody could tie to an app (Windows' gaps, UDP, network overhead).
-- **Live** per-app numbers come from Windows' per-connection TCP counters. UDP traffic (some games, video calls, YouTube over QUIC) shows as Unattributed. The total speed at the top is always exact.
+- Whatever is left after the named apps shows as **Unattributed**: traffic nobody could tie to an app (gaps in Windows' history, network overhead).
+- **Live** per-app numbers come from Windows' per-connection TCP counters plus its network event feed for UDP, so calls, streams, games and QUIC (e.g. YouTube) show by app name too. Packet headers and other overhead stay Unattributed. The total speed at the top is always exact.
 - While open, NetUsage also saves its live numbers every minute. They only fill the time after the newest hour Windows has saved.
 
 ## Run from source
@@ -66,7 +66,7 @@ python test_data.py
 ## Build the .exe
 
 ```
-python -m PyInstaller --noconfirm --onefile --windowed --uac-admin --name NetUsage --icon netusage.ico --add-data "netusage.ico;." --collect-submodules dissect --collect-submodules pystray app.py
+python -m PyInstaller --noconfirm --onefile --windowed --uac-admin --name NetUsage --icon netusage.ico --add-data "netusage.ico;." --collect-submodules dissect --collect-submodules pystray --collect-submodules etw app.py
 ```
 
 The .exe ends up in `dist\NetUsage.exe`. The icon is drawn by `make_icon.py`.

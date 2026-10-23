@@ -315,6 +315,7 @@ class App(ctk.CTk):
             self.refresh_history()  # pick up whatever Windows saved while the window was hidden
 
     def quit_app(self):
+        self.sampler.stop()  # ends the Windows event session; it would outlive us otherwise
         self.tray.stop()
         self.destroy()
 
