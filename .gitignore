@@ -1,0 +1,8 @@
+build/
+build_usb/
+dist/
+dist_usb/
+__pycache__/
+*.spec
+# personal usage numbers from the investigation; not for a public repo
+unnamed-traffic-findings.md
