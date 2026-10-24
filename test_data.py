@@ -146,10 +146,13 @@ sys.executable = real_exe
 
 # Adapters: one that drops out and comes back (wake from sleep) must not count its whole history.
 before = {"Wi-Fi": (100, 1000)}
-assert data._nic_delta(before, {}) == (0, 0)                                    # asleep: Wi-Fi gone
-assert data._nic_delta({}, {"Wi-Fi": (5 * 10**9, 8 * 10**9)}) == (0, 0)         # back with its running count
-assert data._nic_delta(before, {"Wi-Fi": (150, 1600)}) == (50, 600)             # normal second
-assert data._nic_delta(before, {"Wi-Fi": (10, 20)}) == (0, 0)                   # counter reset
+assert data._nic_delta(before, {}, 1) == (0, 0)                                    # asleep: Wi-Fi gone
+assert data._nic_delta({}, {"Wi-Fi": (5 * 10**9, 8 * 10**9)}, 1) == (0, 0)         # back with its running count
+assert data._nic_delta(before, {"Wi-Fi": (150, 1600)}, 1) == (50, 600)             # normal second
+assert data._nic_delta(before, {"Wi-Fi": (10, 20)}, 1) == (0, 0)                   # counter reset
+# read 0 for a moment, then the whole running count again: faster than a 2.9 Gbit/s link can go, so ignored
+assert data._nic_delta({"Wi-Fi": (0, 0)}, {"Wi-Fi": (10**9, 13 * 10**9)}, 1, {"Wi-Fi": 2882}) == (0, 0)
+assert data._nic_delta({"Wi-Fi": (0, 0)}, {"Wi-Fi": (10**6, 3 * 10**8)}, 1, {"Wi-Fi": 2882}) == (10**6, 3 * 10**8)  # fast but real
 
 # UDP: events add up per process; traffic between programs on this PC is ignored.
 from collections import defaultdict

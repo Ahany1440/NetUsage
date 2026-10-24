@@ -479,12 +479,18 @@ def _nic_totals():
             if not any(v in name.lower() for v in VIRTUAL_NICS)}
 
 
-def _nic_delta(old, new):
-    """(sent, recv) between two _nic_totals() readings. Each adapter is compared only with itself, and only
-    if it was there both times: after sleep Wi-Fi drops out and comes back carrying its whole running count."""
-    common = old.keys() & new.keys()
-    return (sum(max(new[n][0] - old[n][0], 0) for n in common),
-            sum(max(new[n][1] - old[n][1], 0) for n in common))
+def _nic_delta(old, new, seconds, speeds=None):
+    """(sent, recv) between two _nic_totals() readings taken `seconds` apart. Each adapter is compared only
+    with itself, and only if it was there both times. Around sleep, Wi-Fi can vanish or read 0 for a moment
+    and then report its whole running count again; a jump faster than its link speed is that, not traffic."""
+    speeds = speeds or {}
+    sent = recv = 0
+    for n in old.keys() & new.keys():
+        ds, dr = max(new[n][0] - old[n][0], 0), max(new[n][1] - old[n][1], 0)
+        limit = (speeds.get(n) or 10_000) * 125_000 * (seconds + 1)  # Mbit/s -> bytes, +1 s of slack
+        if ds + dr <= limit:
+            sent, recv = sent + ds, recv + dr
+    return sent, recv
 
 
 class LiveSampler(threading.Thread):
@@ -538,7 +544,8 @@ class LiveSampler(threading.Thread):
     def _sample(self):
         now, nic = time.time(), _nic_totals()
         dt = max(now - self._last_t, 0.001)
-        sent, recv = _nic_delta(self._last_nic, nic)
+        sent, recv = _nic_delta(self._last_nic, nic, now - self._last_t,
+                                {n: st.speed for n, st in psutil.net_if_stats().items()})
         self._last_nic, self._last_t = nic, now
 
         cur = tcp_counters(self._enabled)
