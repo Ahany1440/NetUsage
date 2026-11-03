@@ -76,6 +76,16 @@ apps = {a: (r, s) for a, r, s in h["apps"]}
 assert apps["Discord"] == (800 + 700, 50 + 10), apps                # 800 in the Windows hour + the later live 700
 assert sum(h["recv"]) == 7000 + 1000 + 800 + 700, h                 # Discord raised the hour; no 9 GB leftovers
 
+# Home-network traffic NetUsage saw (e.g. phone mirroring) comes back out of Windows' app figure and total.
+con = data._db()
+with con:
+    con.execute("INSERT INTO usage VALUES (?,?,?,?,?,?)", (hour + 1700, "Chrome", 0, 600, "lan", None))
+con.close()
+h = data.history(24, "hour")
+apps = {a: (r, s) for a, r, s in h["apps"]}
+assert apps["Chrome"] == (400, 100), apps
+assert sum(h["recv"]) == 7000 + 400 + 800 + 700, h
+
 # Epic: one summary per install, bytes spread over the time it ran (30 min -> 3 pieces).
 logs = os.path.join(data.DATA_DIR, "EpicGamesLauncher", "Saved", "Logs")
 os.makedirs(logs)
@@ -171,8 +181,8 @@ u.add(59, v6(32032, 100, "fe80::1", "2606:4700::1"))
 u.add(43, v4(500, 50, "127.0.0.1", "127.0.0.1"))       # between programs on this PC: ignored
 u.add(59, v6(500, 50, "::1", "::1"))                   # same, IPv6
 u.add(11, v4(500, 999, "8.8.8.8", "192.168.1.5"))      # a TCP event slipping through: ignored
-u.add(43, v4(700, 3000, "192.168.1.5", "192.168.1.9"))  # phone on the home network: kept apart as None
-assert dict(u.take()) == {32032: [1200, 1000], None: [0, 3000]}, u.bytes
+u.add(43, v4(700, 3000, "192.168.1.5", "192.168.1.9"))  # phone on the home network: kept apart
+assert dict(u.take()) == {(32032, False): [1200, 1000], (700, True): [0, 3000]}, u.bytes
 assert dict(u.take()) == {}  # take() empties it
 
 # 5-minute view: samples land in 10-second bars; anything older than 5 minutes drops out.

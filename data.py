@@ -299,14 +299,21 @@ def _hourly_rows(con, since):
     # SRUM only credits apps with part of their traffic. An app's own log and NetUsage's live recording
     # measure it directly, so per app and hour the biggest of the three wins (they overlap, never add).
     starts = sorted(hours)
-    better = {src: defaultdict(lambda: [0, 0]) for src in ("applog", "live")}
-    for src, ts, app, r, s in con.execute("SELECT src, ts, app, recv, sent FROM usage WHERE src IN ('applog', 'live') "
-                                          "AND ts >= ?", (since - 3600,)):
+    better = {src: defaultdict(lambda: [0, 0]) for src in ("applog", "live", "lan")}
+    for src, ts, app, r, s in con.execute("SELECT src, ts, app, recv, sent FROM usage "
+                                          "WHERE src IN ('applog', 'live', 'lan') AND ts >= ?", (since - 3600,)):
         i = bisect_right(starts, ts) - 1
         name = display_name(app)
         if i >= 0 and ts < starts[i] + 3600 and name not in LEFTOVER_NAMES:
             better[src][starts[i], name][0] += r
             better[src][starts[i], name][1] += s
+    # SRUM also counts home-network traffic (e.g. phone mirroring) that NetUsage saw while running: take it out.
+    for (ts, app), (r, s) in better.pop("lan").items():
+        total, apps = hours[ts]
+        for k, v in ((0, r), (1, s)):
+            total[k] = max(total[k] - v, 0)
+            if app in apps:
+                apps[app][k] = max(apps[app][k] - v, 0)
     for found in better.values():
         for (ts, app), (r, s) in found.items():
             rec = hours[ts][1][app]
@@ -333,7 +340,7 @@ def history(n, unit):
     if unit == "hour":
         start = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=n - 1)
         labels = [(start + timedelta(hours=i)).strftime("%H:00") for i in range(n)]
-        spans = [f"{t}â€“{(int(t[:2]) + 1) % 24:02d}:00" for t in labels]
+        spans = [f"{t}–{(int(t[:2]) + 1) % 24:02d}:00" for t in labels]
     else:
         start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=n - 1)
         labels = spans = [(start + timedelta(days=i)).strftime("%b %d") for i in range(n)]
@@ -485,7 +492,7 @@ class UdpCounter:
         from etw import evntprov
         from etw.common import RETURN_RAW_UNFORMATTED_DATA
         self.lock = threading.Lock()
-        self.bytes = defaultdict(lambda: [0, 0])  # pid -> [sent, recv]
+        self.bytes = defaultdict(lambda: [0, 0])  # (pid, lan) -> [sent, recv]
         self._ids = _EventIds(1, 0, len(UDP_EVENTS), (ctypes.c_ushort * 4)(*UDP_EVENTS))
         flt = evntprov.EVENT_FILTER_DESCRIPTOR(ctypes.addressof(self._ids), ctypes.sizeof(self._ids),
                                                evntprov.EVENT_FILTER_TYPE_EVENT_ID)
@@ -515,13 +522,13 @@ class UdpCounter:
         addrs = [payload[8 + i * n:8 + (i + 1) * n] for i in (0, 1)]
         if any(_is_loopback(a) for a in addrs):
             return  # traffic between programs on this PC never touches the network
-        if all(_is_local(a) for a in addrs):
-            pid = None  # home network only (e.g. phone mirroring): crosses the adapter, not the internet
+        # home network only (e.g. phone mirroring): crosses the adapter, not the internet
+        lan = all(_is_local(a) for a in addrs)
         with self.lock:
-            self.bytes[pid][UDP_EVENTS[event_id]] += size
+            self.bytes[pid, lan][UDP_EVENTS[event_id]] += size
 
     def take(self):
-        """{pid: [sent, recv]} since the last call; pid None is home-network traffic."""
+        """{(pid, lan): [sent, recv]} since the last call; lan means home-network traffic."""
         with self.lock:
             out, self.bytes = self.bytes, defaultdict(lambda: [0, 0])
         return out
@@ -568,6 +575,7 @@ class LiveSampler(threading.Thread):
         self._enabled = set()
         self._prev = {}
         self._minute = defaultdict(lambda: [0, 0])  # app -> [sent, recv]
+        self._lan_minute = defaultdict(lambda: [0, 0])  # same, home-network traffic only
         try:
             self._udp = UdpCounter()
         except Exception:
@@ -589,7 +597,9 @@ class LiveSampler(threading.Thread):
 
     def _flush(self, minute_start):
         rows = [(minute_start, a, s, r, "live", None) for a, (s, r) in self._minute.items() if s or r]
+        rows += [(minute_start, a, s, r, "lan", None) for a, (s, r) in self._lan_minute.items() if s or r]
         self._minute.clear()
+        self._lan_minute.clear()
         self._apps.clear()  # pids get reused
         if rows:
             with closing(_db()) as con, con:
@@ -618,19 +628,25 @@ class LiveSampler(threading.Thread):
         cur = tcp_counters(self._enabled)
         self._enabled &= cur.keys()
         per_app = defaultdict(lambda: [0, 0])
-        lan = [0, 0]  # home-network traffic: on the adapter, but not internet use, so left out
+        # home-network traffic: on the adapter, but not internet use. Left out here, and saved per app
+        # so history can take it back out of Windows' figures (they count it).
+        lan = defaultdict(lambda: [0, 0])
         for key, (pid, b_out, b_in, is_lan) in cur.items():
             if key in self._prev:  # first sight is just the baseline
                 p_out, p_in = self._prev[key]
-                to = lan if is_lan else per_app[self._app(pid)]
+                to = (lan if is_lan else per_app)[self._app(pid)]
                 to[0] += max(b_out - p_out, 0)
                 to[1] += max(b_in - p_in, 0)
         self._prev = {k: (v[1], v[2]) for k, v in cur.items()}
-        for pid, (s, r) in (self._udp.take() if self._udp else {}).items():
-            to = lan if pid is None else per_app[self._app(pid)]
+        for (pid, is_lan), (s, r) in (self._udp.take() if self._udp else {}).items():
+            to = (lan if is_lan else per_app)[self._app(pid)]
             to[0] += s
             to[1] += r
-        sent, recv = max(sent - lan[0], 0), max(recv - lan[1], 0)
+        sent = max(sent - sum(v[0] for v in lan.values()), 0)
+        recv = max(recv - sum(v[1] for v in lan.values()), 0)
+        for app, (s, r) in lan.items():
+            self._lan_minute[app][0] += s
+            self._lan_minute[app][1] += r
         # NIC counters include headers, UDP and QUIC; whatever TCP stats can't place goes here.
         per_app[OTHER][0] += max(sent - sum(v[0] for v in per_app.values()), 0)
         per_app[OTHER][1] += max(recv - sum(v[1] for v in per_app.values()), 0)
@@ -668,6 +684,6 @@ class LiveSampler(threading.Thread):
                     buckets[i][app][1] += s
         at = [datetime.fromtimestamp(start + i * step) for i in range(n + 1)]
         return {"labels": [t.strftime("%H:%M:%S") for t in at[:-1]],
-                "spans": [f"{a:%H:%M:%S}â€“{b:%H:%M:%S}" for a, b in zip(at, at[1:])],
+                "spans": [f"{a:%H:%M:%S}–{b:%H:%M:%S}" for a, b in zip(at, at[1:])],
                 "recv": recv, "sent": sent, "apps": top_apps(buckets),
                 "buckets": [top_apps([b]) for b in buckets]}
