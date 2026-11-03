@@ -70,3 +70,7 @@ python -m PyInstaller --noconfirm --onefile --windowed --uac-admin --name NetUsa
 ```
 
 The .exe ends up in `dist\NetUsage.exe`. The icon is drawn by `make_icon.py`.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
