@@ -184,4 +184,29 @@ assert len(r["labels"]) == 30 and len(r["spans"]) == 30
 assert sum(r["recv"]) == 607 and sum(r["sent"]) == 15, r
 assert [a for a, _, _ in r["apps"]] == ["Steam", "Discord"], r["apps"]
 assert r["buckets"][-1] == [("Steam", 100, 5), ("Discord", 7, 0)], r["buckets"][-1]
+
+# File locations: SRUM's device paths become normal ones; the main exe wins over helpers; gone files don't show.
+drives = {r"\device\harddiskvolume3": "C:"}
+assert data._dos_path(r"\Device\HarddiskVolume3\Steam\steam.exe", drives) == r"C:\Steam\steam.exe"
+assert data._dos_path(r"D:\Games\x.exe", drives) == r"D:\Games\x.exe"
+assert data._dos_path("dosvc", drives) is None and data._dos_path(None, drives) is None
+assert data._dos_path(r"\Device\HarddiskVolume9\a.exe", drives) is None  # unknown drive
+apps_dir = tempfile.mkdtemp()
+main, helper = os.path.join(apps_dir, "steam.exe"), os.path.join(apps_dir, "bin", "cef", "steamwebhelper.exe")
+os.makedirs(os.path.dirname(helper))
+for f in (main, helper):
+    open(f, "w").close()
+found = {}
+data._keep_shortest(found, "Steam", helper)
+data._keep_shortest(found, "Steam", main)
+data._keep_shortest(found, "Steam", None)
+assert found == {"Steam": main}, found
+data._save_paths({"Steam": helper})
+data._save_paths(found)
+data._save_paths({"Steam": helper})  # a later helper sighting doesn't replace the main exe
+assert data.app_path("Steam") == main and data.app_path("Nope") is None
+os.remove(main)
+assert data.app_path("Steam") is None  # uninstalled
+data._save_paths({"Steam": helper})  # old path gone, so a longer one may replace it
+assert data.app_path("Steam") == helper
 print("all data checks passed")

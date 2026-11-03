@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import tkinter as tk
 from datetime import datetime
 
 import customtkinter as ctk
@@ -82,12 +83,14 @@ def stat(parent, caption, color, size=34):
 
 class Table(ctk.CTkFrame):
     """Fixed-row table; set() rewrites the label texts instead of rebuilding widgets.
-    With bars=True, column 1 is a bar showing each row's share."""
+    With bars=True, column 1 is a bar showing each row's share. Right-clicking a row calls
+    on_menu(event, app name)."""
 
-    def __init__(self, parent, headers, colors, rows, bars=False):
+    def __init__(self, parent, headers, colors, rows, bars=False, on_menu=None):
         super().__init__(parent, fg_color="transparent")
         self.grid_columnconfigure(0, weight=1)
         self.bars = []
+        self.names = []
         cols = list(headers)
         if bars:
             cols.insert(1, "")
@@ -108,10 +111,14 @@ class Table(ctk.CTkFrame):
                 cell = ctk.CTkLabel(self, text="", text_color=colors[c], font=(FONT, 13),
                                     anchor="w" if c == 0 else "e")
                 cell.grid(row=r, column=c, sticky="ew", padx=(0, 16), pady=1)
+                if on_menu:
+                    cell.bind("<Button-3>", lambda e, i=r - 1: i < len(self.names) and on_menu(e, self.names[i]))
                 row.append(cell)
             self.cells.append(row)
 
-    def set(self, rows, shares=()):
+    def set(self, rows, shares=(), names=None):
+        """names: the full app name per row, when column 0 shows a shortened one."""
+        self.names = names or [row[0] for row in rows]
         for r, row in enumerate(self.cells):
             for c, cell in enumerate(row):
                 cell.configure(text=rows[r][c] if r < len(rows) else "")
@@ -127,7 +134,7 @@ class HistoryTab:
     """Totals, a bar chart and the app list for one period. load() returns data.history()-shaped dicts;
     step is how many bars share one axis label; every is how often (seconds) to redraw."""
 
-    def __init__(self, tab, load, period, step, every=60):
+    def __init__(self, tab, load, period, step, every=60, on_menu=None):
         self.load, self.period, self.step, self.every = load, period, step, every
         self.h, self.selected, self.tip = None, None, None
         top = ctk.CTkFrame(tab, fg_color="transparent")
@@ -155,7 +162,7 @@ class HistoryTab:
         self.caption.pack(anchor="w", padx=16, pady=(14, 0))
         self.hint = ctk.CTkLabel(right, text="", text_color=MUTED, font=(FONT, 12))
         self.hint.pack(anchor="w", padx=16, pady=(0, 8))
-        self.table = Table(right, ("App", "Download", "Upload"), (TEXT, DOWN, UP), 14, bars=True)
+        self.table = Table(right, ("App", "Download", "Upload"), (TEXT, DOWN, UP), 14, bars=True, on_menu=on_menu)
         self.table.pack(fill="both", expand=True, padx=16, pady=(0, 12))
 
     def span(self, i):
@@ -231,7 +238,7 @@ class HistoryTab:
         apps = self.h["apps"] if sel is None else self.h["buckets"][sel]
         self.caption.configure(text=f"Apps, {self.period if sel is None else self.span(sel)}")
         if sel is None:
-            self.hint.configure(text="Click a bar to see the apps behind it")
+            self.hint.configure(text="Click a bar to see the apps behind it. Right-click an app to find its file.")
         else:
             self.hint.configure(text="Click the bar again to see the whole period" if apps
                                 else "Nothing was recorded then")
@@ -239,7 +246,7 @@ class HistoryTab:
         biggest = max((r + s for _, r, s in apps), default=0) or 1
         self.table.set([(a if len(a) <= 30 else a[:29] + "…", data.fmt_bytes(r), data.fmt_bytes(s))
                         for a, r, s in apps],
-                       [(r + s) / biggest for _, r, s in apps])
+                       [(r + s) / biggest for _, r, s in apps], [a for a, _, _ in apps])
 
 
 class App(ctk.CTk):
@@ -264,10 +271,14 @@ class App(ctk.CTk):
         self.build_live(tabs.add("Live"))
         self.history = {
             # from the sampler's memory, so it only covers time since NetUsage started
-            "5 minutes": HistoryTab(tabs.add("5 minutes"), lambda: self.sampler.recent(), "last 5 minutes", 6, every=5),
-            "24 hours": HistoryTab(tabs.add("24 hours"), lambda: data.history(24, "hour"), "last 24 hours", 3),
-            "7 days": HistoryTab(tabs.add("7 days"), lambda: data.history(7, "day"), "last 7 days", 1),
-            "30 days": HistoryTab(tabs.add("30 days"), lambda: data.history(30, "day"), "last 30 days", 5),
+            "5 minutes": HistoryTab(tabs.add("5 minutes"), lambda: self.sampler.recent(), "last 5 minutes", 6,
+                                    every=5, on_menu=self.app_menu),
+            "24 hours": HistoryTab(tabs.add("24 hours"), lambda: data.history(24, "hour"), "last 24 hours", 3,
+                                   on_menu=self.app_menu),
+            "7 days": HistoryTab(tabs.add("7 days"), lambda: data.history(7, "day"), "last 7 days", 1,
+                                 on_menu=self.app_menu),
+            "30 days": HistoryTab(tabs.add("30 days"), lambda: data.history(30, "day"), "last 30 days", 5,
+                                  on_menu=self.app_menu),
         }
 
         bar = ctk.CTkFrame(self, fg_color="transparent")
@@ -338,9 +349,25 @@ class App(ctk.CTk):
         self.live_fig, self.live_canvas = chart(left, 6, 3)
         self.live_canvas.get_tk_widget().pack(fill="both", expand=True, padx=8, pady=8)
         ctk.CTkLabel(right, text="Using the internet right now", text_color=TEXT,
-                     font=(FONT, 14, "bold")).pack(anchor="w", padx=16, pady=(14, 8))
-        self.live_table = Table(right, ("App", "Down", "Up"), (TEXT, DOWN, UP), 12)
+                     font=(FONT, 14, "bold")).pack(anchor="w", padx=16, pady=(14, 0))
+        ctk.CTkLabel(right, text="Right-click an app to find its file.", text_color=MUTED,
+                     font=(FONT, 12)).pack(anchor="w", padx=16, pady=(0, 8))
+        self.live_table = Table(right, ("App", "Down", "Up"), (TEXT, DOWN, UP), 12, on_menu=self.app_menu)
         self.live_table.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+
+    def app_menu(self, event, app):
+        """Right-click menu on an app row: open or copy where its .exe lives."""
+        leftover = app in data.LEFTOVER_NAMES
+        path = None if leftover else self.sampler.paths.get(app) or data.app_path(app)
+        menu = tk.Menu(self, tearoff=0, bg=TIP, fg=TEXT, activebackground="#38414f", activeforeground=TEXT,
+                       disabledforeground=MUTED, bd=0, relief="flat", font=(FONT, 10))
+        if path:
+            menu.add_command(label="  Open file location", command=lambda: subprocess.Popen(f'explorer /select,"{path}"'))
+            menu.add_command(label="  Copy path", command=lambda: (self.clipboard_clear(), self.clipboard_append(path)))
+        else:
+            menu.add_command(state="disabled", label="  Not one app: traffic Windows couldn't tie to a program"
+                             if leftover else "  File location unknown (Windows service, store app or removed)")
+        menu.tk_popup(event.x_root, event.y_root)
 
     def draw_live(self):
         with self.sampler.lock:

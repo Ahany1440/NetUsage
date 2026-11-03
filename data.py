@@ -46,6 +46,7 @@ def _db():
     con.execute("CREATE TABLE IF NOT EXISTS usage(ts INTEGER, app TEXT, sent INTEGER, recv INTEGER,"
                 " src TEXT, key TEXT UNIQUE)")
     con.execute("CREATE INDEX IF NOT EXISTS usage_ts ON usage(ts)")
+    con.execute("CREATE TABLE IF NOT EXISTS paths(app TEXT PRIMARY KEY, path TEXT)")  # display name -> .exe
     return con
 
 
@@ -93,6 +94,47 @@ def display_name(app):
     return app[:1].upper() + app[1:]
 
 
+def _drives():
+    """{'\\device\\harddiskvolume3': 'C:', ...} for turning SRUM's device paths into normal ones."""
+    out, buf = {}, ctypes.create_unicode_buffer(1024)
+    for d in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+        if ctypes.windll.kernel32.QueryDosDeviceW(f"{d}:", buf, len(buf)):
+            out[buf.value.lower()] = f"{d}:"
+    return out
+
+
+def _dos_path(raw, drives):
+    """'\\Device\\HarddiskVolume3\\x\\y.exe' -> 'C:\\x\\y.exe'; None for services and store-app ids."""
+    low = (raw or "").lower()
+    if not low.endswith(".exe"):
+        return None
+    for dev, letter in drives.items():
+        if low.startswith(dev + "\\"):
+            return letter + raw[len(dev):]
+    return raw if re.match(r"^[a-z]:\\", low) else None
+
+
+def _keep_shortest(found, app, path):
+    if path and (app not in found or len(path) < len(found[app])):  # e.g. steam.exe over its helpers
+        found[app] = path
+
+
+def _save_paths(found):
+    """Remember {display name: exe path}. A shorter path (the main exe) wins unless the old one is gone."""
+    with closing(_db()) as con, con:
+        for app, path in found.items():
+            old = con.execute("SELECT path FROM paths WHERE app = ?", (app,)).fetchone()
+            if not old or len(path) < len(old[0]) or not os.path.exists(old[0]):
+                con.execute("INSERT OR REPLACE INTO paths VALUES (?, ?)", (app, path))
+
+
+def app_path(app):
+    """The .exe behind a display name, or None if unknown or no longer on disk."""
+    with closing(_db()) as con:
+        row = con.execute("SELECT path FROM paths WHERE app = ?", (app,)).fetchone()
+    return row[0] if row and os.path.exists(row[0]) else None
+
+
 def fmt_bytes(n):
     if n >= 1024 ** 3:
         return f"{n / 1024 ** 3:.2f} GB"
@@ -115,7 +157,7 @@ def import_srum():
         raise RuntimeError("Windows would not copy its usage database. "
                            "Run the app as administrator.\n" + r.stdout.strip()[-300:])
 
-    rows = []
+    rows, paths, drives = [], {}, _drives()
     try:
         with open(copy, "rb") as fh:
             for e in SRU(fh).get_table_entries(table_name="network_data"):
@@ -123,7 +165,9 @@ def import_srum():
                 if stamp is None:
                     continue
                 try:
-                    app = app_name(e["AppId"])
+                    raw = e["AppId"]
+                    app = app_name(raw)
+                    _keep_shortest(paths, display_name(app), _dos_path(raw, drives))
                 except IndexError:  # app id missing from SRUM's id map
                     app = "unknown"
                 if stamp.tzinfo is None:  # SRUM stores UTC
@@ -135,6 +179,7 @@ def import_srum():
                              f"{rec.get('InterfaceLuid')}|{rec.get('L2ProfileId')}"))
     finally:
         os.remove(copy)  # holds every user's app history; don't leave it lying around
+    _save_paths(paths)
     return _insert(rows)
 
 
@@ -288,7 +333,7 @@ def history(n, unit):
     if unit == "hour":
         start = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=n - 1)
         labels = [(start + timedelta(hours=i)).strftime("%H:00") for i in range(n)]
-        spans = [f"{t}–{(int(t[:2]) + 1) % 24:02d}:00" for t in labels]
+        spans = [f"{t}â€“{(int(t[:2]) + 1) % 24:02d}:00" for t in labels]
     else:
         start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=n - 1)
         labels = spans = [(start + timedelta(days=i)).strftime("%b %d") for i in range(n)]
@@ -519,6 +564,7 @@ class LiveSampler(threading.Thread):
         self.samples = deque(maxlen=320)  # (time, {app: (sent, recv)}) per second, for the 5-minute view
         self.top = []  # [(app, down_bps, up_bps)], busiest first
         self._apps = {}
+        self.paths = {}  # display name -> exe, saved with each minute
         self._enabled = set()
         self._prev = {}
         self._minute = defaultdict(lambda: [0, 0])  # app -> [sent, recv]
@@ -534,9 +580,11 @@ class LiveSampler(threading.Thread):
     def _app(self, pid):  # not _name: Thread uses that attribute
         if pid not in self._apps:
             try:
-                self._apps[pid] = display_name(psutil.Process(pid).name().lower())
+                proc = psutil.Process(pid)
+                self._apps[pid] = display_name(proc.name().lower())
+                _keep_shortest(self.paths, self._apps[pid], proc.exe())
             except psutil.Error:
-                self._apps[pid] = f"pid {pid}"
+                self._apps.setdefault(pid, f"pid {pid}")  # name may be known even if the path is denied
         return self._apps[pid]
 
     def _flush(self, minute_start):
@@ -546,6 +594,9 @@ class LiveSampler(threading.Thread):
         if rows:
             with closing(_db()) as con, con:
                 con.executemany("INSERT INTO usage VALUES (?,?,?,?,?,?)", rows)
+        if self.paths:
+            _save_paths(self.paths)
+            self.paths.clear()
 
     def run(self):
         self._last_nic, self._last_t = _nic_totals(), time.time()
@@ -617,6 +668,6 @@ class LiveSampler(threading.Thread):
                     buckets[i][app][1] += s
         at = [datetime.fromtimestamp(start + i * step) for i in range(n + 1)]
         return {"labels": [t.strftime("%H:%M:%S") for t in at[:-1]],
-                "spans": [f"{a:%H:%M:%S}–{b:%H:%M:%S}" for a, b in zip(at, at[1:])],
+                "spans": [f"{a:%H:%M:%S}â€“{b:%H:%M:%S}" for a, b in zip(at, at[1:])],
                 "recv": recv, "sent": sent, "apps": top_apps(buckets),
                 "buckets": [top_apps([b]) for b in buckets]}
