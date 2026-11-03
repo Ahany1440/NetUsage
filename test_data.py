@@ -124,13 +124,15 @@ assert data.display_name(got[0][0]) == "Fortnite"
 
 # Live sampler: per-app deltas from fake TCP counters must reach the top list.
 ticks = [0]
-data.tcp_counters = lambda enabled: {("k",): (os.getpid(), ticks[0] * 1000, ticks[0] * 50000)}
+data.tcp_counters = lambda enabled: {("k",): (os.getpid(), ticks[0] * 1000, ticks[0] * 50000, False),
+                                     ("phone",): (1, ticks[0] * 10**6, ticks[0] * 10**8, True)}
 s = data.LiveSampler()
 s._last_nic, s._last_t, s._minute_no = data._nic_totals(), time.time() - 1, int(time.time() // 60)
 for ticks[0] in (1, 2, 3):
     s._sample()
 me = [t for t in s.top if t[0] != data.OTHER]
 assert me and me[0][1] > 0, s.top
+assert len(me) == 1, s.top  # home-network connection (phone mirroring) is left out
 
 # Portable mode: only a portable.txt next to the .exe moves the data folder.
 import sys
@@ -169,7 +171,8 @@ u.add(59, v6(32032, 100, "fe80::1", "2606:4700::1"))
 u.add(43, v4(500, 50, "127.0.0.1", "127.0.0.1"))       # between programs on this PC: ignored
 u.add(59, v6(500, 50, "::1", "::1"))                   # same, IPv6
 u.add(11, v4(500, 999, "8.8.8.8", "192.168.1.5"))      # a TCP event slipping through: ignored
-assert dict(u.take()) == {32032: [1200, 1000]}, u.bytes
+u.add(43, v4(700, 3000, "192.168.1.5", "192.168.1.9"))  # phone on the home network: kept apart as None
+assert dict(u.take()) == {32032: [1200, 1000], None: [0, 3000]}, u.bytes
 assert dict(u.take()) == {}  # take() empties it
 
 # 5-minute view: samples land in 10-second bars; anything older than 5 minutes drops out.

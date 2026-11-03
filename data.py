@@ -1,6 +1,7 @@
 """Data layer: SRUM import, live per-app sampling, and the SQLite history store."""
 import ctypes
 import glob
+import ipaddress
 import os
 import re
 import sqlite3
@@ -14,6 +15,7 @@ import winreg
 from bisect import bisect_right
 from collections import defaultdict, deque
 from contextlib import closing
+from functools import lru_cache
 from ctypes import wintypes as wt
 from datetime import datetime, timedelta, timezone
 
@@ -371,8 +373,9 @@ def _tcp_rows(af):
 
 
 def tcp_counters(enabled):
-    """{conn_key: (pid, bytes_out, bytes_in)} for established internet TCP connections.
-    `enabled` is a set of keys we already switched counting on for."""
+    """{conn_key: (pid, bytes_out, bytes_in, lan)} for established TCP connections off this PC;
+    lan is True when both ends are on the home network (e.g. phone mirroring). `enabled` is a set
+    of keys we already switched counting on for."""
     out = {}
     rod = _DataRod()
     on = ctypes.c_ubyte(1)
@@ -385,19 +388,21 @@ def tcp_counters(enabled):
                     continue
                 est, setf, getf = r, _ip.SetPerTcpConnectionEStats, _ip.GetPerTcpConnectionEStats
                 key = (r.laddr, r.lport, r.raddr, r.rport)
+                lan = _is_local(r.laddr.to_bytes(4, "little")) and _is_local(r.raddr.to_bytes(4, "little"))
             else:
                 if bytes(r.raddr) == bytes(15) + b"\x01":  # ::1
                     continue
                 est = _Row6Est(r.state, r.laddr, r.lscope, r.lport, r.raddr, r.rscope, r.rport)
                 setf, getf = _ip.SetPerTcp6ConnectionEStats, _ip.GetPerTcp6ConnectionEStats
                 key = (bytes(r.laddr), r.lport, bytes(r.raddr), r.rport)
+                lan = _is_local(key[0]) and _is_local(key[2])
             if key not in enabled:
                 if setf(ctypes.byref(est), ESTATS_DATA, ctypes.byref(on), 0, 1, 0) != 0:
                     continue  # not admin, or the connection just closed
                 enabled.add(key)
             if getf(ctypes.byref(est), ESTATS_DATA, None, 0, 0, None, 0, 0,
                     ctypes.byref(rod), 0, ctypes.sizeof(rod)) == 0:
-                out[key] = (r.pid, rod.bytes_out, rod.bytes_in)
+                out[key] = (r.pid, rod.bytes_out, rod.bytes_in, lan)
     return out
 
 
@@ -415,6 +420,14 @@ class _EventIds(ctypes.Structure):  # EVENT_FILTER_EVENT_ID, sized for our 4 ids
 def _is_loopback(addr):
     return addr[0] == 127 if len(addr) == 4 else (addr == bytes(15) + bytes([1])  # ::1
         or (addr[:12] == bytes(10) + bytes([255, 255]) and addr[12] == 127))  # ::ffff:127.x
+
+
+@lru_cache(4096)  # called per UDP packet
+def _is_local(addr):
+    """Home-network, link-local, multicast or loopback address: traffic to it never reaches the internet."""
+    ip = ipaddress.ip_address(bytes(addr))
+    ip = getattr(ip, "ipv4_mapped", None) or ip
+    return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
 
 
 class UdpCounter:
@@ -454,13 +467,16 @@ class UdpCounter:
             return
         pid, size = struct.unpack_from("<II", payload)
         n = 4 if event_id in (42, 43) else 16
-        if any(_is_loopback(payload[8 + i * n:8 + (i + 1) * n]) for i in (0, 1)):
+        addrs = [payload[8 + i * n:8 + (i + 1) * n] for i in (0, 1)]
+        if any(_is_loopback(a) for a in addrs):
             return  # traffic between programs on this PC never touches the network
+        if all(_is_local(a) for a in addrs):
+            pid = None  # home network only (e.g. phone mirroring): crosses the adapter, not the internet
         with self.lock:
             self.bytes[pid][UDP_EVENTS[event_id]] += size
 
     def take(self):
-        """{pid: [sent, recv]} since the last call."""
+        """{pid: [sent, recv]} since the last call; pid None is home-network traffic."""
         with self.lock:
             out, self.bytes = self.bytes, defaultdict(lambda: [0, 0])
         return out
@@ -551,15 +567,19 @@ class LiveSampler(threading.Thread):
         cur = tcp_counters(self._enabled)
         self._enabled &= cur.keys()
         per_app = defaultdict(lambda: [0, 0])
-        for key, (pid, b_out, b_in) in cur.items():
+        lan = [0, 0]  # home-network traffic: on the adapter, but not internet use, so left out
+        for key, (pid, b_out, b_in, is_lan) in cur.items():
             if key in self._prev:  # first sight is just the baseline
                 p_out, p_in = self._prev[key]
-                per_app[self._app(pid)][0] += max(b_out - p_out, 0)
-                per_app[self._app(pid)][1] += max(b_in - p_in, 0)
+                to = lan if is_lan else per_app[self._app(pid)]
+                to[0] += max(b_out - p_out, 0)
+                to[1] += max(b_in - p_in, 0)
         self._prev = {k: (v[1], v[2]) for k, v in cur.items()}
         for pid, (s, r) in (self._udp.take() if self._udp else {}).items():
-            per_app[self._app(pid)][0] += s
-            per_app[self._app(pid)][1] += r
+            to = lan if pid is None else per_app[self._app(pid)]
+            to[0] += s
+            to[1] += r
+        sent, recv = max(sent - lan[0], 0), max(recv - lan[1], 0)
         # NIC counters include headers, UDP and QUIC; whatever TCP stats can't place goes here.
         per_app[OTHER][0] += max(sent - sum(v[0] for v in per_app.values()), 0)
         per_app[OTHER][1] += max(recv - sum(v[1] for v in per_app.values()), 0)
