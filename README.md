@@ -23,7 +23,7 @@ Every time you open the app it scans Windows' usage history and the download log
 - While hidden it uses about 106 MB of RAM and 0.1–0.2% CPU.
 
 To start it with Windows, hidden in the tray and with no admin prompt, run this once in an administrator PowerShell (change the path to where you put the .exe):
-
+ 
 ```powershell
 $exe = "C:\Tools\NetUsage.exe"
 $user = "$env:USERDOMAIN\$env:USERNAME"
